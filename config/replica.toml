@@ -1,0 +1,95 @@
+# replica.toml — Per-instance configuration for a D-HotStuff replica.
+#
+# One copy of this file (with different [replica] values) is deployed on each
+# machine running a replica process.  The genesis.toml path MUST point to an
+# identical copy of the genesis committee file on every host.
+#
+# CLI override: every key can be overridden at startup with --set section.key=value.
+
+# ---------------------------------------------------------------------------
+# [replica] — identity and key material for this specific replica instance.
+# ---------------------------------------------------------------------------
+[replica]
+
+# id must exactly match the `id` field in genesis.toml for this replica.
+# Changing this after genesis commits have occurred is a safety violation.
+id = "P1"
+
+# privkey_path — path to the PEM-encoded ECDSA P-256 private key file.
+# The file must be readable only by the replica process (mode 0600).
+# Generate with: openssl ecparam -name prime256v1 -genkey -noout -out <path>
+privkey_path = "./keys/P1.pem"
+
+# genesis — path to the genesis.toml file that defines M0.
+# All replicas must reference a byte-for-byte identical file.
+genesis = "./config/genesis.toml"
+
+# ---------------------------------------------------------------------------
+# [network] — TCP / gRPC transport settings.
+# ---------------------------------------------------------------------------
+[network]
+
+# listen — local address and port to bind the gRPC server on.
+# Use 0.0.0.0:<port> to listen on all interfaces, or 127.0.0.1:<port>
+# for loopback-only (testing).  Must match the address in genesis.toml.
+listen = "0.0.0.0:8001"
+
+# dial_timeout_ms — milliseconds to wait when opening a new outbound gRPC
+# connection to a peer.  Valid range: 100–30000.
+# Increase on high-latency WAN links; decrease for tight LAN clusters.
+dial_timeout_ms = 2000
+
+# max_connections — maximum number of simultaneous outbound peer connections.
+# At minimum this should equal |committee| - 1.  Valid range: 1–1024.
+max_connections = 16
+
+# ---------------------------------------------------------------------------
+# [consensus] — HotStuff / D-HotStuff protocol parameters.
+# ---------------------------------------------------------------------------
+[consensus]
+
+# view_timeout_ms — how long (in ms) a replica waits for a Propose message
+# before declaring the current leader faulty and broadcasting NewViewMsg.
+# Valid range: 100–60000.  Should be several multiples of round-trip latency.
+view_timeout_ms = 1000
+
+# batch_size — maximum number of MembershipRequest entries packed into one Block.
+# Valid range: 1–65535.  Larger batches increase throughput at the cost of
+# latency; tune alongside max_batch_bytes.
+batch_size = 256
+
+# max_batch_bytes — hard upper bound on the serialised size of the batch field
+# in a Block, in bytes.  The leader stops filling a batch once either
+# batch_size or max_batch_bytes is reached, whichever comes first.
+# Default: 5 242 880 (5 MiB).  Valid range: 1024–67108864 (64 MiB).
+max_batch_bytes = 5242880
+
+# ---------------------------------------------------------------------------
+# [snapshot] — periodic state-machine snapshots for fast replica recovery.
+# ---------------------------------------------------------------------------
+[snapshot]
+
+# enabled — set to false to disable snapshotting entirely (useful in testing).
+enabled = true
+
+# interval_blocks — take a snapshot every N committed blocks.
+# Valid range: 1–100000.  Lower values speed up recovery but increase I/O.
+interval_blocks = 100
+
+# dir — directory where snapshot files are written.
+# The process must have read/write access.  Snapshots are named
+# <height>.snap and the latest symlink points to the most recent one.
+dir = "./data/snapshots"
+
+# ---------------------------------------------------------------------------
+# [metrics] — Prometheus instrumentation.
+# ---------------------------------------------------------------------------
+[metrics]
+
+# enabled — set to false to disable the Prometheus HTTP endpoint entirely.
+enabled = true
+
+# prometheus_port — port on which the /metrics HTTP endpoint is served.
+# Valid range: 1024–65535.  The endpoint is served on all interfaces.
+# Scrape with: curl http://localhost:9090/metrics
+prometheus_port = 9090
