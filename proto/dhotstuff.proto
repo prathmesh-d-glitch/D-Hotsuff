@@ -1,0 +1,212 @@
+syntax = "proto3";
+
+// Package dhotstuff defines the wire types and gRPC service for the
+// D-HotStuff dynamic-committee BFT consensus protocol.
+//
+// D-HotStuff extends HotStuff with first-class membership-change support:
+//   - Every block carries a batch of MembershipRequests (ADD / REMOVE / REGULAR).
+//   - The QuorumCert stores raw per-replica ECDSA signatures together with
+//     signer identities so that a verifier does not need a fixed committee map.
+//   - conf_number tracks the configuration epoch; view_number tracks the
+//     monotone leader-rotation counter within an epoch.
+package dhotstuff;
+
+import "google/protobuf/empty.proto";
+
+option go_package = "github.com/prathmesh-d-glitch/d-hotstuff/proto/dhotstuffpb";
+
+// ---------------------------------------------------------------------------
+// Enumerations
+// ---------------------------------------------------------------------------
+
+// RequestType classifies a client command carried inside a MembershipRequest.
+//
+//   REGULAR – ordinary application command; no committee change.
+//   ADD     – request to add the identified client to the active committee.
+//   REMOVE  – request to remove the identified client from the active committee.
+enum RequestType {
+  // Default value; represents a normal (non-membership) client command.
+  REGULAR = 0;
+  // Membership-addition request for the identified replica.
+  ADD     = 1;
+  // Membership-removal request for the identified replica.
+  REMOVE  = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Core data types
+// ---------------------------------------------------------------------------
+
+// MembershipRequest wraps a single client command together with its
+// classification so that the consensus layer can route REGULAR commands to the
+// application state machine and ADD/REMOVE commands to the membership manager.
+message MembershipRequest {
+  // Classifies whether this is a plain command or a committee change.
+  RequestType type      = 1;
+
+  // Stable string identity of the originating client (e.g. a public key
+  // fingerprint or a human-readable name).
+  string      client_id = 2;
+
+  // Opaque, application-level command payload.  For ADD/REMOVE requests this
+  // typically encodes the replica's network address and public key material.
+  bytes       payload   = 3;
+}
+
+// QuorumCert is D-HotStuff's quorum certificate.
+//
+// Unlike the upstream hotstuffpb.QuorumCert (which uses a polymorphic
+// QuorumSignature that may be a BLS aggregate), D-HotStuff always stores
+// individual raw ECDSA signatures so that membership-change proofs can be
+// audited without access to a fixed, pre-shared committee roster.
+//
+// Fields:
+//   type        – human-readable label ("generic", "prepare", etc.).
+//   view_number – monotone view counter at which the QC was formed.
+//   conf_number – configuration epoch under which the QC was formed.
+//   block_hash  – SHA-256 hash of the certified block.
+//   signatures  – one DER-encoded ECDSA signature per quorum member.
+//   signer_ids  – replica IDs corresponding to each entry in `signatures`.
+//                 len(signer_ids) == len(signatures) MUST hold.
+message QuorumCert {
+  // Label distinguishing QC roles in the protocol (e.g. "generic").
+  string          type        = 1;
+
+  // View number at the time the certificate was assembled.
+  uint64          view_number = 2;
+
+  // Configuration (epoch) number at the time the certificate was assembled.
+  uint64          conf_number = 3;
+
+  // SHA-256 digest of the serialised Block this certificate covers.
+  bytes           block_hash  = 4;
+
+  // Raw DER-encoded ECDSA signatures, one per quorum participant.
+  repeated bytes  signatures  = 5;
+
+  // Stable string replica identifiers aligned with `signatures`.
+  repeated string signer_ids  = 6;
+}
+
+// Block is the unit of replication in D-HotStuff.
+//
+// It extends the plain HotStuff block with:
+//   - A batch of typed MembershipRequests instead of opaque Commands.
+//   - conf_number to let replicas detect epoch boundaries.
+//   - A D-HotStuff QuorumCert (justify) that carries individual ECDSA sigs.
+message Block {
+  // SHA-256 hash of the parent block.  All zeros for the genesis block.
+  bytes                     parent_hash = 1;
+
+  // Ordered list of client requests included in this block.
+  repeated MembershipRequest batch       = 2;
+
+  // QC over the parent block; the "justify" link in the HotStuff chain.
+  QuorumCert                 justify     = 3;
+
+  // Chain height (0-indexed; genesis = 0).
+  uint64                     height      = 4;
+
+  // Configuration epoch this block was proposed under.
+  uint64                     conf_number = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Protocol messages
+// ---------------------------------------------------------------------------
+
+// NewViewMsg is sent by a replica to the next leader when it advances to a new
+// view, carrying the highest generic QC it knows of so that the leader can
+// assemble a fresh HighQC.
+message NewViewMsg {
+  // View the sender is advancing *to*.
+  uint64     view_number = 1;
+
+  // Configuration epoch of the sender.
+  uint64     conf_number = 2;
+
+  // The highest generic QC known to the sender at the time of sending.
+  QuorumCert generic_qc  = 3;
+}
+
+// VoteMsg is the vote a replica casts for a proposed block.
+//
+// The leader collects 2f+1 VoteMsgs and combines their `signature` fields into
+// a QuorumCert for the next block's `justify`.
+message VoteMsg {
+  // View in which this vote is cast.
+  uint64 view_number = 1;
+
+  // Configuration epoch in which this vote is cast.
+  uint64 conf_number = 2;
+
+  // SHA-256 hash of the block being voted on.
+  bytes  block_hash  = 3;
+
+  // DER-encoded ECDSA signature over (view_number || conf_number || block_hash).
+  bytes  signature   = 4;
+
+  // Stable string identity of the signing replica.
+  string signer_id   = 5;
+}
+
+// ---------------------------------------------------------------------------
+// State-sync messages (used by late-joining / recovering replicas)
+// ---------------------------------------------------------------------------
+
+// UpdateRequest is sent by a replica that needs to synchronise with the
+// current leader (e.g. after a restart or a membership-add event).
+message UpdateRequest {
+  // Identity of the replica requesting the update.
+  string replica_id = 1;
+}
+
+// UpdateResponse carries the highest committed block known to the responder,
+// allowing the requester to fast-forward its local state.
+message UpdateResponse {
+  // The best (highest committed) block the responder is aware of.
+  Block best_block = 1;
+}
+
+// HistoryRequest is sent by a replica that needs the full committed chain,
+// typically after being added to the committee as a new member.
+message HistoryRequest {
+  // Identity of the replica requesting history.
+  string replica_id = 1;
+}
+
+// HistoryResponse delivers an ordered sequence of committed blocks,
+// oldest-first, so that the requester can replay them and reconstruct state.
+message HistoryResponse {
+  // Committed blocks in ascending height order (genesis block first).
+  repeated Block history = 1;
+}
+
+// ---------------------------------------------------------------------------
+// gRPC service definition
+// ---------------------------------------------------------------------------
+
+// DHotStuff is the peer-to-peer RPC surface of the D-HotStuff protocol.
+//
+// All four RPCs are point-to-point (unicast); multicast is handled at the
+// caller level (e.g. gorums or a simple fan-out loop).
+service DHotStuff {
+  // Propose is called by the current leader to send a new Block to a replica.
+  // The replica validates the block and, if acceptable, returns a signed
+  // VoteMsg.  On failure the replica SHOULD return a gRPC status error rather
+  // than an empty vote.
+  rpc Propose(Block) returns (VoteMsg);
+
+  // SendNewView is called by a replica to deliver a NewViewMsg to the next
+  // leader.  The leader collects these messages to determine HighQC.
+  // Returns google.protobuf.Empty on success.
+  rpc SendNewView(NewViewMsg) returns (google.protobuf.Empty);
+
+  // RequestUpdate is called by a replica that needs to learn the current
+  // best-committed block from a peer (lightweight catch-up).
+  rpc RequestUpdate(UpdateRequest) returns (UpdateResponse);
+
+  // RequestHistory is called by a newly added (or recovering) replica to
+  // download the full committed chain from a peer.
+  rpc RequestHistory(HistoryRequest) returns (HistoryResponse);
+}
