@@ -1,0 +1,62 @@
+# genesis.toml — Initial committee M0 for a D-HotStuff cluster.
+#
+# Every replica in the cluster MUST boot with an identical copy of this file.
+# It defines the starting membership set (configuration number 0) that all
+# nodes treat as ground truth before any ADD/REMOVE membership-change block
+# has been committed.  Disagreement on M0 is a safety violation.
+#
+# To bootstrap a new cluster:
+#   1. Generate key pairs for each replica (see `make keys`).
+#   2. Fill in the real base64-encoded public keys below.
+#   3. Distribute this file out-of-band to every replica before first start.
+#   4. Keep a cryptographically signed, immutable copy for auditing.
+
+# ---------------------------------------------------------------------------
+# [committee] — cluster-wide constants for the genesis configuration.
+# ---------------------------------------------------------------------------
+[committee]
+
+# config_number identifies this membership epoch.
+# M0 is always 0.  Every committed ADD/REMOVE block increments this by 1.
+config_number = 0
+
+# ---------------------------------------------------------------------------
+# [[replicas]] — one entry per initial committee member.
+#
+# Fields:
+#   id      — stable, unique string identity used in VoteMsg.signer_id and
+#             MembershipRequest.client_id.  Treat it like a hostname: short,
+#             DNS-safe, and never reused after a REMOVE.
+#
+#   address — TCP endpoint this replica listens on for peer RPCs (host:port).
+#             Must be reachable by every other replica in the committee.
+#             The port range 8001-8004 is used here; adjust for your network.
+#
+#   pubkey  — Base64-encoded (standard encoding, no line breaks) DER-format
+#             ECDSA P-256 uncompressed public key (SubjectPublicKeyInfo, RFC 5480).
+#             Generate with:
+#               openssl ecparam -name prime256v1 -genkey -noout -out priv.pem
+#               openssl ec -in priv.pem -pubout -outform DER | base64 -w0
+#             The runtime rejects keys that fail ECDSA P-256 parsing.
+# ---------------------------------------------------------------------------
+
+[[replicas]]
+id      = "P1"
+address = "127.0.0.1:8001"
+# Replace with real SubjectPublicKeyInfo DER bytes, base64-encoded.
+pubkey  = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+[[replicas]]
+id      = "P2"
+address = "127.0.0.1:8002"
+pubkey  = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+[[replicas]]
+id      = "P3"
+address = "127.0.0.1:8003"
+pubkey  = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+[[replicas]]
+id      = "P4"
+address = "127.0.0.1:8004"
+pubkey  = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
