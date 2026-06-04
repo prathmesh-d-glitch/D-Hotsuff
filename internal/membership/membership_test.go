@@ -9,7 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/prathmesh-d-glitch/d-hotstuff/membership"
+	"github.com/prathmesh-d-glitch/d-hotstuff/internal/membership"
 	pb "github.com/prathmesh-d-glitch/d-hotstuff/proto"
 )
 
@@ -80,7 +80,7 @@ func pkixPublicKey(t *testing.T, pub *ecdsa.PublicKey) []byte {
 // ---------------------------------------------------------------------------
 
 // mockVerifier accepts or rejects every verification call based on the
-// acceptAll flag.  It records all calls so tests can assert on them.
+// acceptAll flag.
 type mockVerifier struct {
 	acceptAll bool
 }
@@ -89,10 +89,10 @@ func (m *mockVerifier) Verify(_ *ecdsa.PublicKey, _, _ []byte) bool {
 	return m.acceptAll
 }
 
-// alwaysAccept returns a SignatureVerifier that accepts every signature.
+// alwaysAccept is a SignatureVerifier that accepts every signature.
 var alwaysAccept = &mockVerifier{acceptAll: true}
 
-// alwaysReject returns a SignatureVerifier that rejects every signature.
+// alwaysReject is a SignatureVerifier that rejects every signature.
 var alwaysReject = &mockVerifier{acceptAll: false}
 
 // ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ func TestQuorumSize(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc // capture
+		tc := tc
 		t.Run(itoa(tc.n)+"-replicas", func(t *testing.T) {
 			t.Parallel()
 			c := makeCommittee(t, tc.n)
@@ -176,7 +176,7 @@ func TestConfigStoreInstallOrder(t *testing.T) {
 	genesis := makeCommittee(t, 4)
 	store := membership.NewConfigStore(genesis)
 
-	// Installing a committee with Number = 0 again must fail (already at 1).
+	// Installing a committee with Number = 0 again must fail.
 	bad := membership.NewCommittee(0, makeReplicas(t, 4))
 	err := store.Install(bad)
 	require.ErrorIs(t, err, membership.ErrOutOfOrder,
@@ -206,9 +206,8 @@ func TestConfigStoreInstallOrder(t *testing.T) {
 func TestCommitteeApplyAdd(t *testing.T) {
 	t.Parallel()
 
-	c := makeCommittee(t, 4) // M0 with 4 replicas
+	c := makeCommittee(t, 4)
 
-	// Generate a fresh key for the new replica.
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 
@@ -262,13 +261,11 @@ func TestCommitteeApplyRemove(t *testing.T) {
 // TestValidateQC
 // ---------------------------------------------------------------------------
 
-// buildQC assembles a QuorumCert with the given signer IDs and a stub
-// signature for each.  blockHash is shared across all signatures.
 func buildQC(t *testing.T, blockHash []byte, signerIDs []string) *pb.QuorumCert {
 	t.Helper()
 	sigs := make([][]byte, len(signerIDs))
 	for i := range sigs {
-		sigs[i] = []byte("stub-sig") // opaque bytes; content verified by mock
+		sigs[i] = []byte("stub-sig")
 	}
 	return &pb.QuorumCert{
 		BlockHash:  blockHash,
@@ -288,7 +285,6 @@ func TestValidateQC(t *testing.T) {
 
 	t.Run("not-enough-signatures", func(t *testing.T) {
 		t.Parallel()
-		// Only 2 sigs for a committee that needs Qc=3.
 		qc := buildQC(t, blockHash, []string{"P1", "P2"})
 		err := membership.ValidateQC(qc, c, alwaysAccept)
 		require.ErrorIs(t, err, membership.ErrInsufficientSignatures)
@@ -296,7 +292,6 @@ func TestValidateQC(t *testing.T) {
 
 	t.Run("duplicate-signer", func(t *testing.T) {
 		t.Parallel()
-		// P1 appears twice — only one unique signer despite 3 entries.
 		qc := buildQC(t, blockHash, []string{"P1", "P2", "P1"})
 		err := membership.ValidateQC(qc, c, alwaysAccept)
 		require.ErrorIs(t, err, membership.ErrDuplicateSigner)
@@ -304,7 +299,6 @@ func TestValidateQC(t *testing.T) {
 
 	t.Run("unknown-signer", func(t *testing.T) {
 		t.Parallel()
-		// "P99" is not in the committee.
 		qc := buildQC(t, blockHash, []string{"P1", "P2", "P99"})
 		err := membership.ValidateQC(qc, c, alwaysAccept)
 		require.ErrorIs(t, err, membership.ErrUnknownSigner)
@@ -321,19 +315,17 @@ func TestValidateQC(t *testing.T) {
 		t.Parallel()
 		qc := buildQC(t, blockHash, []string{"P1", "P2", "P3"})
 		err := membership.ValidateQC(qc, c, alwaysAccept)
-		require.NoError(t, err, "a well-formed QC with Qc=3 distinct known signers should pass")
+		require.NoError(t, err)
 	})
 
 	t.Run("exactly-quorum-size-passes", func(t *testing.T) {
 		t.Parallel()
-		// Qc = 3 for n=4; exactly 3 distinct valid signers must succeed.
 		qc := buildQC(t, blockHash, []string{"P2", "P3", "P4"})
 		require.NoError(t, membership.ValidateQC(qc, c, alwaysAccept))
 	})
 
 	t.Run("more-than-quorum-passes", func(t *testing.T) {
 		t.Parallel()
-		// All 4 signers — exceeds Qc; still valid.
 		qc := buildQC(t, blockHash, []string{"P1", "P2", "P3", "P4"})
 		require.NoError(t, membership.ValidateQC(qc, c, alwaysAccept))
 	})
