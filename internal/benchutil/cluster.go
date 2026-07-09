@@ -1,35 +1,5 @@
-// Package benchutil provides an in-process benchmark harness for the D-HotStuff
-// consensus protocol.
-//
-// BenchCluster drives the real consensus engine — ECDSA P-256 signing, QC
-// creation, safeNode checks, pipelined three-chain delivery — without a real
-// TCP transport.  This isolates the consensus CPU cost from network latency,
-// making it suitable for throughput and latency microbenchmarks.
-//
-// # Relationship to the paper's evaluation (§6.2)
-//
-// The paper deploys one replica per port on a single machine (AMD Ryzen 9
-// 3900X, 32 GB RAM) and measures:
-//
-//   - Throughput (ktx/s):   avg transactions delivered per honest replica/s
-//   - Latency (seconds):    client submit → fc+1 consistent replies
-//
-// Our in-process harness removes TCP overhead, so absolute throughput numbers
-// will exceed the paper's results; however, the relative scaling trend
-// (throughput ∝ 1/n for fixed payload, latency ∝ payload) matches exactly.
-//
-// # Consensus round model
-//
-// Each call to RunRound simulates one full Chained HotStuff view:
-//
-//  1. Leader creates a leaf block extending the current genericQC.
-//  2. All Qc replicas sign the block hash: crypto.Sign (ECDSA P-256).
-//  3. Leader aggregates votes and calls crypto.CreateQC.
-//  4. All replicas validate the QC and update safety state.
-//  5. Pipeline window advances; if a three-chain forms, Deliver is called.
-//
-// The total authenticator work per round is O(Qc) sign operations +
-// O(Qc) verify operations, matching the paper's O(n²) per-round cost.
+// Package benchutil provides an in-process benchmark harness for D-HotStuff.
+// Runs real consensus code (ECDSA, QC, safeNode, pipeline) without TCP.
 package benchutil
 
 import (
@@ -48,10 +18,7 @@ import (
 	pb "github.com/prathmesh-d-glitch/d-hotstuff/proto"
 )
 
-// ---------------------------------------------------------------------------
-// memBlockchain — in-memory BlockchainReader
-// ---------------------------------------------------------------------------
-
+// memBlockchain is an in-memory BlockchainReader.
 type memBlockchain struct {
 	mu     sync.RWMutex
 	blocks map[string]*pb.Block
@@ -61,8 +28,7 @@ func newMemBlockchain() *memBlockchain {
 	return &memBlockchain{blocks: make(map[string]*pb.Block)}
 }
 
-// hashBlock returns the SHA-256 of (parentHash || height_BE8), matching
-// the canonical hash used by the consensus package.
+// hashBlock returns SHA-256(parentHash || height_BE8) — same as the consensus package.
 func hashBlock(b *pb.Block) []byte {
 	h := sha256.New()
 	h.Write(b.GetParentHash())
@@ -115,18 +81,13 @@ func (m *memBlockchain) Extends(childHash, ancestorHash []byte) bool {
 	return false
 }
 
-// ---------------------------------------------------------------------------
-// safeNodeState — per-replica safety variables
-// ---------------------------------------------------------------------------
-
+// safeNodeState holds per-replica safety variables.
 type safeNodeState struct {
 	lockedQC  *pb.QuorumCert
 	genericQC *pb.QuorumCert
 }
 
-// safeNode implements Algorithm 1:
-//
-//	safeNode(node, qc) = (node extends lockedQC.node) OR (qc.view > lockedQC.view)
+// safeNode returns true if it is safe to vote for node (Algorithm 1).
 func (s *safeNodeState) safeNode(node *pb.Block, qc *pb.QuorumCert, bc *memBlockchain) bool {
 	if s.lockedQC == nil {
 		return true
@@ -137,10 +98,7 @@ func (s *safeNodeState) safeNode(node *pb.Block, qc *pb.QuorumCert, bc *memBlock
 	return bc.Extends(node.GetParentHash(), s.lockedQC.GetBlockHash())
 }
 
-// ---------------------------------------------------------------------------
-// pipelineWindow — four-slot sliding window for pipelined commits
-// ---------------------------------------------------------------------------
-
+// pipelineWindow is a 4-slot sliding window for pipelined commits.
 type pipelineWindow struct {
 	slots [4]*pb.Block
 }
@@ -171,10 +129,7 @@ func (p *pipelineWindow) advance(b *pb.Block) *pb.Block {
 
 func (p *pipelineWindow) reset() { p.slots = [4]*pb.Block{} }
 
-// ---------------------------------------------------------------------------
-// deliverCounter — tracks committed transactions
-// ---------------------------------------------------------------------------
-
+// deliverCounter tracks committed transactions and applies membership changes.
 type deliverCounter struct {
 	mu        sync.Mutex
 	delivered int
@@ -186,7 +141,7 @@ func (d *deliverCounter) deliver(block *pb.Block) int {
 	defer d.mu.Unlock()
 	n := len(block.GetBatch())
 	d.delivered += n
-	// Apply membership changes so the committee evolves correctly.
+	// apply membership changes so the committee evolves correctly
 	mc, err := d.configs.AtNumber(block.GetConfNumber())
 	if err != nil {
 		return n
@@ -217,23 +172,13 @@ func (d *deliverCounter) reset() {
 	d.delivered = 0
 }
 
-// ---------------------------------------------------------------------------
-// BenchCluster — main benchmark harness
-// ---------------------------------------------------------------------------
-
 // BenchCluster is an n-replica in-process D-HotStuff cluster.
-// All consensus operations (sign, aggregate, QC create, safety update,
-// pipeline commit) use the real production code paths.
-//
-// Create once with NewBenchCluster (key generation is slow) and call
-// Reset between benchmark iterations.
+// Create once with NewBenchCluster (keygen is slow) and call Reset between runs.
 type BenchCluster struct {
-	// Exported fields allow benchmarks to inspect committee parameters.
 	N       int
 	MC      *membership.Committee
 	Configs *membership.ConfigStore
 
-	// Private: consensus state.
 	keys      []*ecdsa.PrivateKey
 	safety    []*safeNodeState
 	pipeline  *pipelineWindow
@@ -245,9 +190,7 @@ type BenchCluster struct {
 	lastHash  []byte
 }
 
-// NewBenchCluster creates an n-replica benchmark cluster.
-// Key generation takes ~0.5 ms per replica on modern hardware.
-// Call once per benchmark suite and Reset between iterations.
+// NewBenchCluster creates an n-replica cluster. Key generation takes ~0.5 ms/replica.
 func NewBenchCluster(n int) (*BenchCluster, error) {
 	if n < 4 {
 		return nil, fmt.Errorf("benchutil: n must be ≥ 4 (nc ≥ 3fc+1 requires n ≥ 4)")
@@ -299,39 +242,24 @@ func NewBenchCluster(n int) (*BenchCluster, error) {
 	}, nil
 }
 
-// ---------------------------------------------------------------------------
-// RoundResult — timing breakdown of one consensus round
-// ---------------------------------------------------------------------------
-
-// RoundResult holds the timing breakdown of a single consensus round.
+// RoundResult holds the timing breakdown of one consensus round.
 type RoundResult struct {
 	LeaderPropose  time.Duration // block creation
 	SignPhase      time.Duration // Qc ECDSA sign operations
-	AggregatePhase time.Duration // vote aggregation + CreateQC
-	DeliverPhase   time.Duration // pipeline advance + Deliver
+	AggregatePhase time.Duration // vote aggregation + QC creation
+	DeliverPhase   time.Duration // pipeline advance + deliver
 	TotalRound     time.Duration // end-to-end
-	TxDelivered    int           // transactions committed this round (0 until pipeline fills)
+	TxDelivered    int           // transactions committed this round
 }
 
-// ---------------------------------------------------------------------------
-// RunRound — one full pipelined D-HotStuff consensus round
-// ---------------------------------------------------------------------------
-
-// RunRound executes one full consensus round with the given batch and returns
-// timing metrics.  It is NOT safe for concurrent use.
-//
-// Round steps (Algorithm 3):
-//  1. Leader creates a leaf block (lines 6–8).
-//  2. Qc replicas sign the block hash (line 20).
-//  3. Leader aggregates votes and creates QC (lines 9–11).
-//  4. All replicas update safeNode state (lines 21–24).
-//  5. Pipeline window advances; commit if three-chain forms (lines 25–26).
+// RunRound executes one full consensus round and returns timing metrics.
+// Not safe for concurrent use.
 func (c *BenchCluster) RunRound(batch []*pb.MembershipRequest) (RoundResult, error) {
 	mc := c.Configs.Latest()
 	qSize := mc.QuorumSize()
 	t0 := time.Now()
 
-	// Step 1 — Leader creates leaf block.
+	// step 1: leader creates the block
 	t1 := time.Now()
 	block := &pb.Block{
 		ParentHash: c.lastHash,
@@ -344,7 +272,7 @@ func (c *BenchCluster) RunRound(batch []*pb.MembershipRequest) (RoundResult, err
 	blockHash := hashBlock(block)
 	proposeTime := time.Since(t1)
 
-	// Step 2 — Qc replicas sign the block hash.
+	// step 2: quorum replicas sign
 	t2 := time.Now()
 	votes := make([]*pb.VoteMsg, 0, qSize)
 	for i := 0; i < qSize && i < len(c.keys); i++ {
@@ -362,7 +290,7 @@ func (c *BenchCluster) RunRound(batch []*pb.MembershipRequest) (RoundResult, err
 	}
 	signTime := time.Since(t2)
 
-	// Step 3 — Leader aggregates votes and creates QC.
+	// step 3: aggregate votes and create QC
 	t3 := time.Now()
 	var acc []*pb.VoteMsg
 	for _, v := range votes {
@@ -375,7 +303,7 @@ func (c *BenchCluster) RunRound(batch []*pb.MembershipRequest) (RoundResult, err
 	qc.ViewNumber = c.curView
 	aggTime := time.Since(t3)
 
-	// Step 4 — All replicas update safety state.
+	// step 4: update safety state for all replicas
 	for _, s := range c.safety {
 		if s.safeNode(block, block.GetJustify(), c.chain) {
 			s.genericQC = qc
@@ -387,7 +315,7 @@ func (c *BenchCluster) RunRound(batch []*pb.MembershipRequest) (RoundResult, err
 		}
 	}
 
-	// Step 5 — Pipeline advance; commit if three-chain formed.
+	// step 5: pipeline advance; commit if three-chain formed
 	t4 := time.Now()
 	toCommit := c.pipeline.advance(block)
 	var txDelivered int
@@ -396,7 +324,6 @@ func (c *BenchCluster) RunRound(batch []*pb.MembershipRequest) (RoundResult, err
 	}
 	deliverTime := time.Since(t4)
 
-	// Advance state for next round.
 	c.genericQC = qc
 	c.lastHash = blockHash
 	c.curView++
@@ -412,12 +339,7 @@ func (c *BenchCluster) RunRound(batch []*pb.MembershipRequest) (RoundResult, err
 	}, nil
 }
 
-// ---------------------------------------------------------------------------
-// RunRounds — convenience wrapper for multiple rounds
-// ---------------------------------------------------------------------------
-
-// RunRounds runs numRounds consensus rounds with the given batch and returns
-// aggregate throughput (transactions per second) and total committed tx count.
+// RunRounds runs numRounds consensus rounds and returns aggregate TPS.
 func (c *BenchCluster) RunRounds(numRounds int, batch []*pb.MembershipRequest) (tps float64, txTotal int, err error) {
 	start := time.Now()
 	for i := 0; i < numRounds; i++ {
@@ -434,12 +356,7 @@ func (c *BenchCluster) RunRounds(numRounds int, batch []*pb.MembershipRequest) (
 	return tps, txTotal, nil
 }
 
-// ---------------------------------------------------------------------------
-// SignBlock — expose signing for QC micro-benchmarks
-// ---------------------------------------------------------------------------
-
-// SignBlock signs blockHash on behalf of replica index idx.
-// Used by BenchmarkQCCreation to isolate the signing cost.
+// SignBlock signs blockHash on behalf of replica idx (for QC micro-benchmarks).
 func (c *BenchCluster) SignBlock(idx int, viewNum, confNum uint64, blockHash []byte) ([]byte, error) {
 	if idx < 0 || idx >= len(c.keys) {
 		return nil, fmt.Errorf("benchutil: replica index %d out of range [0, %d)", idx, len(c.keys))
@@ -447,19 +364,13 @@ func (c *BenchCluster) SignBlock(idx int, viewNum, confNum uint64, blockHash []b
 	return dhcrypto.Sign(c.keys[idx], viewNum, confNum, blockHash)
 }
 
-// CreateQCFromVotes assembles a QuorumCert from a slice of VoteMsgs.
-// Delegates to crypto.CreateQC.
+// CreateQCFromVotes assembles a QuorumCert from votes.
 func (c *BenchCluster) CreateQCFromVotes(votes []*pb.VoteMsg) (*pb.QuorumCert, error) {
 	mc := c.Configs.Latest()
 	return dhcrypto.CreateQC(votes, mc)
 }
 
-// ---------------------------------------------------------------------------
-// Reset — reset cluster for re-use between benchmark iterations
-// ---------------------------------------------------------------------------
-
-// Reset clears the pipeline, resets the block chain, and zeroes all safety
-// state so the cluster can be re-used for a fresh benchmark run.
+// Reset clears the pipeline and safety state for a fresh benchmark run.
 // Keys and committee parameters are preserved.
 func (c *BenchCluster) Reset() {
 	c.pipeline.reset()
@@ -480,19 +391,11 @@ func (c *BenchCluster) Reset() {
 	c.dlv.reset()
 }
 
-// TotalDelivered returns the cumulative committed transaction count since the
-// last Reset.
+// TotalDelivered returns the cumulative committed transaction count since last Reset.
 func (c *BenchCluster) TotalDelivered() int { return c.dlv.total() }
 
-// ---------------------------------------------------------------------------
-// MakeBatch — create a realistic transaction batch
-// ---------------------------------------------------------------------------
-
-// MakeBatch returns a slice of REGULAR MembershipRequests, each carrying a
-// 250-byte payload, totalling approximately payloadMB megabytes.
-//
-// 250 bytes/tx matches the paper §6.2 ("transaction size aligns with typical
-// blockchain systems, e.g., Bitcoin and Ethereum").
+// MakeBatch returns a slice of REGULAR requests each carrying a 250-byte payload,
+// totalling approximately payloadMB megabytes.
 func MakeBatch(payloadMB int) []*pb.MembershipRequest {
 	const txSize = 250
 	txCount := (payloadMB * 1024 * 1024) / txSize
@@ -500,7 +403,6 @@ func MakeBatch(payloadMB int) []*pb.MembershipRequest {
 	batch := make([]*pb.MembershipRequest, txCount)
 	for i := range batch {
 		p := make([]byte, txSize)
-		// Deterministic content: vary first two bytes to distinguish txs.
 		p[0] = byte(i & 0xFF)
 		p[1] = byte((i >> 8) & 0xFF)
 		for j := 2; j < txSize; j++ {
@@ -515,6 +417,5 @@ func MakeBatch(payloadMB int) []*pb.MembershipRequest {
 	return batch
 }
 
-// EmptyBatch is a zero-transaction batch used to simulate a view-change round
-// (the leader fails before proposing real transactions).
+// EmptyBatch simulates a view-change round (no real transactions).
 var EmptyBatch = []*pb.MembershipRequest{}
