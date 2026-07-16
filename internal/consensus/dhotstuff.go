@@ -1,16 +1,6 @@
 //go:build !simulation
 
-// dhotstuff.go — main D-HotStuff replica loop implementing Algorithm 3 from the paper.
-//
-// This file wires together the SafetyState, PipelineState, Deliverer, and
-// ViewChanger into a single DHotStuff struct that drives the full consensus
-// protocol for one replica.
-//
-// The design uses interfaces (Executor, Replier, NetworkSender,
-// BlockchainReader) for dependency injection, keeping this core loop free
-// of network or storage concerns.
-//
-// Reference: D-HotStuff Algorithm 3 (full protocol).
+// dhotstuff.go — D-HotStuff replica loop (Algorithm 3).
 package consensus
 
 import (
@@ -21,63 +11,40 @@ import (
 
 	dhcrypto "github.com/prathmesh-d-glitch/d-hotstuff/internal/crypto"
 	"github.com/prathmesh-d-glitch/d-hotstuff/internal/membership"
+	"github.com/prathmesh-d-glitch/d-hotstuff/internal/reputation"
 	pb "github.com/prathmesh-d-glitch/d-hotstuff/proto"
 )
 
-// DHotStuff is the main consensus engine for a single D-HotStuff replica.
-//
-// It implements Algorithm 3 of the paper: propose, vote, update safety state,
-// commit via the three-chain rule, and deliver batches to the application.
+// DHotStuff is the consensus engine for one replica.
 type DHotStuff struct {
-	// myID is this replica's stable string identity.
-	myID string
-
-	// curView is the current view number (monotonically increasing).
+	myID    string
 	curView uint64
-
-	// curConf is the configuration number of the latest known committee.
 	curConf uint64
 
-	// safety holds lockedQC and genericQC.
-	safety *SafetyState
-
-	// pipeline tracks the 4-block sliding window for pipelined commits.
-	pipeline *PipelineState
-
-	// deliverer handles exactly-once block delivery and membership install.
+	safety    *SafetyState
+	pipeline  *PipelineState
 	deliverer *Deliverer
+	vc        *ViewChanger
 
-	// vc handles view-change (timeout → NewViewMsg).
-	vc *ViewChanger
-
-	// configs is the thread-safe append-only committee store.
-	configs *membership.ConfigStore
-
-	// blockchain provides read access to the local block store.
+	configs    *membership.ConfigStore
 	blockchain BlockchainReader
+	net        NetworkSender
 
-	// net is the network transport for sending/broadcasting messages.
-	net NetworkSender
+	repStore    *reputation.Store
+	repSelector *reputation.LeaderSelector
 
-	// signer provides ECDSA P-256 sign and verify.
 	privKey interface {
 		Sign(viewNum, confNum uint64, blockHash []byte) ([]byte, error)
 	}
 
-	// requestQ buffers incoming client requests for the next proposal.
-	requestQ chan *pb.MembershipRequest
-
-	// votesBuf accumulates votes per view for quorum detection.
-	votesBuf map[uint64][]*pb.VoteMsg
-
-	// newViewBuf accumulates NewViewMsgs per view for the leader.
+	requestQ   chan *pb.MembershipRequest
+	votesBuf   map[uint64][]*pb.VoteMsg
 	newViewBuf map[uint64][]*pb.NewViewMsg
 
-	// mu protects all mutable state.
 	mu sync.Mutex
 }
 
-// NewDHotStuff constructs a DHotStuff replica with the provided dependencies.
+// NewDHotStuff builds a replica with all its dependencies wired in.
 func NewDHotStuff(
 	myID string,
 	configs *membership.ConfigStore,
@@ -87,31 +54,39 @@ func NewDHotStuff(
 	replier Replier,
 	signFn func(viewNum, confNum uint64, blockHash []byte) ([]byte, error),
 	requestQSize int,
+	repStore *reputation.Store,
 ) *DHotStuff {
 	safety := &SafetyState{}
 	pipeline := &PipelineState{}
 	deliverer := NewDeliverer(configs, executor, replier)
 	vc := NewViewChanger(0, safety, configs, net, myID)
 
+	var repSelector *reputation.LeaderSelector
+	if repStore != nil {
+		repSelector = reputation.NewLeaderSelector(repStore)
+	}
+
 	return &DHotStuff{
-		myID:       myID,
-		curView:    0,
-		curConf:    0,
-		safety:     safety,
-		pipeline:   pipeline,
-		deliverer:  deliverer,
-		vc:         vc,
-		configs:    configs,
-		blockchain: blockchain,
-		net:        net,
-		privKey:    &signerAdapter{signFn},
-		requestQ:   make(chan *pb.MembershipRequest, requestQSize),
-		votesBuf:   make(map[uint64][]*pb.VoteMsg),
-		newViewBuf: make(map[uint64][]*pb.NewViewMsg),
+		myID:        myID,
+		curView:     0,
+		curConf:     0,
+		safety:      safety,
+		pipeline:    pipeline,
+		deliverer:   deliverer,
+		vc:          vc,
+		configs:     configs,
+		blockchain:  blockchain,
+		net:         net,
+		repStore:    repStore,
+		repSelector: repSelector,
+		privKey:     &signerAdapter{signFn},
+		requestQ:    make(chan *pb.MembershipRequest, requestQSize),
+		votesBuf:    make(map[uint64][]*pb.VoteMsg),
+		newViewBuf:  make(map[uint64][]*pb.NewViewMsg),
 	}
 }
 
-// signerAdapter wraps a function into the sign interface.
+// signerAdapter wraps a plain function into the sign interface.
 type signerAdapter struct {
 	fn func(viewNum, confNum uint64, blockHash []byte) ([]byte, error)
 }
@@ -120,28 +95,18 @@ func (s *signerAdapter) Sign(viewNum, confNum uint64, blockHash []byte) ([]byte,
 	return s.fn(viewNum, confNum, blockHash)
 }
 
-// SubmitRequest enqueues a client request for inclusion in the next proposal.
-// It is non-blocking if the request queue has capacity; otherwise it blocks.
+// SubmitRequest enqueues a client request for the next proposal.
 func (d *DHotStuff) SubmitRequest(req *pb.MembershipRequest) {
 	d.requestQ <- req
 }
 
-// HandlePropose processes a proposed block received from the current leader.
-//
-// Implements Algorithm 3, lines 17–26:
-//  1. Validate the block's configuration number.
-//  2. Look up b* → b″ → b′ → b using the block's Justify chain.
-//  3. If SafeNode holds: sign and send a vote to the leader.
-//  4. Update safety state (one-chain → genericQC, two-chain → lockedQC).
-//  5. If three-chain holds: deliver the committed block.
-//  6. Advance the pipeline.
+// HandlePropose processes a block from the current leader (Algorithm 3, lines 17–26).
 func (d *DHotStuff) HandlePropose(block *pb.Block) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	mc := d.configs.Latest()
 
-	// Algorithm 3, line 17: validate conf_number.
 	if block.GetConfNumber() > mc.Number {
 		log.Printf("d-hotstuff: block conf_number %d > latest %d; ignoring",
 			block.GetConfNumber(), mc.Number)
@@ -150,7 +115,7 @@ func (d *DHotStuff) HandlePropose(block *pb.Block) {
 
 	qc := block.GetJustify()
 
-	// Algorithm 3, line 18: look up the chain b* → b'' → b' → b.
+	// walk the chain: b* → b'' → b' → b
 	bStar := block
 	var bDouble, bPrime, b *pb.Block
 
@@ -170,7 +135,7 @@ func (d *DHotStuff) HandlePropose(block *pb.Block) {
 		}
 	}
 
-	// Algorithm 3, line 19: safeNode check — vote only if it passes.
+	// vote if safeNode passes
 	if d.safety.SafeNode(bStar, qc, d.blockchain) {
 		blockHash := hashBlock(bStar)
 		sig, err := d.privKey.Sign(bStar.GetConfNumber(), mc.Number, blockHash)
@@ -187,33 +152,35 @@ func (d *DHotStuff) HandlePropose(block *pb.Block) {
 			SignerId:   d.myID,
 		}
 
-		// Send vote to the current leader.
-		leader := mc.Leader(d.curView)
+		leader := d.selectLeader(mc)
 		if err := d.net.Send(leader.Addr, vote); err != nil {
 			log.Printf("d-hotstuff: send vote error: %v", err)
 		}
 	}
 
-	// Algorithm 3, lines 21–22: update genericQC on one-chain.
+	// one-chain → update genericQC
 	if bDouble != nil {
 		d.safety.UpdateOnOneChain(bStar, bDouble)
 	}
 
-	// Algorithm 3, lines 23–24: update lockedQC on two-chain.
+	// two-chain → update lockedQC
 	if bDouble != nil && bPrime != nil {
 		d.safety.UpdateOnTwoChain(bStar, bDouble, bPrime)
 	}
 
-	// Algorithm 3, lines 25–26: commit on three-chain.
+	// three-chain → commit
 	if bDouble != nil && bPrime != nil && b != nil {
 		if d.deliverer.CheckThreeChain(bStar, bDouble, bPrime, b) {
 			if err := d.deliverer.Deliver(b); err != nil {
 				log.Printf("d-hotstuff: deliver error: %v", err)
 			}
+			if d.repStore != nil {
+				leaderID := d.selectLeader(mc).ID
+				d.repStore.RecordCommit(leaderID, b.GetHeight())
+			}
 		}
 	}
 
-	// Advance the pipeline.
 	if toDeliver := d.pipeline.Advance(bStar); toDeliver != nil {
 		if err := d.deliverer.Deliver(toDeliver); err != nil {
 			log.Printf("d-hotstuff: pipeline deliver error: %v", err)
@@ -221,46 +188,59 @@ func (d *DHotStuff) HandlePropose(block *pb.Block) {
 	}
 }
 
-// HandleVote processes an incoming vote from a replica (leader only).
-//
-// Votes are accumulated per view.  Once a quorum of distinct votes is
-// collected, a QuorumCert is created and the leader proposes the next block.
+// HandleVote collects votes; proposes next block once quorum is reached.
 func (d *DHotStuff) HandleVote(vote *pb.VoteMsg) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	mc := d.configs.Latest()
+
+	replica := mc.ReplicaByID(vote.GetSignerId())
+	if replica == nil {
+		log.Printf("d-hotstuff: vote from unknown signer %q; dropping", vote.GetSignerId())
+		return
+	}
+
+	if replica.PubKey == nil {
+		log.Printf("d-hotstuff: signer %q has no public key; dropping vote", vote.GetSignerId())
+		return
+	}
+
+	if !dhcrypto.Verify(
+		replica.PubKey,
+		vote.GetViewNumber(),
+		vote.GetConfNumber(),
+		vote.GetBlockHash(),
+		vote.GetSignature(),
+	) {
+		log.Printf("d-hotstuff: invalid vote signature from %q; dropping", vote.GetSignerId())
+		return
+	}
+
 	view := vote.GetViewNumber()
 	d.votesBuf[view] = dhcrypto.AggregateVotes(d.votesBuf[view], vote)
 
-	mc := d.configs.Latest()
 	if !dhcrypto.HasQuorum(d.votesBuf[view], mc) {
 		return // not enough votes yet
 	}
 
-	// Quorum reached — create QC.
 	qc, err := dhcrypto.CreateQC(d.votesBuf[view], mc)
 	if err != nil {
 		log.Printf("d-hotstuff: CreateQC error: %v", err)
 		return
 	}
 
-	// Advance view.
 	d.curView++
-	delete(d.votesBuf, view) // clean up old view
+	delete(d.votesBuf, view)
 
-	// Update genericQC if this QC is newer.
 	if d.safety.GenericQC == nil || qc.GetViewNumber() > d.safety.GenericQC.GetViewNumber() {
 		d.safety.GenericQC = qc
 	}
 
-	// Propose next block.
 	d.propose(qc)
 }
 
-// HandleNewView processes an incoming NewViewMsg (leader only).
-//
-// The leader accumulates NewViewMsgs for its view.  Once a quorum is
-// collected, it extracts the highest genericQC and proposes.
+// HandleNewView collects new-view messages; proposes when quorum is reached.
 func (d *DHotStuff) HandleNewView(msg *pb.NewViewMsg) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -274,26 +254,26 @@ func (d *DHotStuff) HandleNewView(msg *pb.NewViewMsg) {
 		return // not enough new-view messages yet
 	}
 
-	delete(d.newViewBuf, view) // clean up
+	delete(d.newViewBuf, view)
 
-	// Use the highest QC from the collected NewViewMsgs.
 	if highQC != nil {
 		if d.safety.GenericQC == nil || highQC.GetViewNumber() > d.safety.GenericQC.GetViewNumber() {
 			d.safety.GenericQC = highQC
 		}
 	}
 
-	// Propose with the best QC.
 	d.propose(d.safety.GenericQC)
 }
 
-// HandleTimeout is called when the view timer expires.
-//
-// Delegates to the ViewChanger which increments the view and sends a
-// NewViewMsg to the next leader.  Clears vote buffers for the timed-out view.
+// HandleTimeout fires when the view timer expires; kicks off a view change.
 func (d *DHotStuff) HandleTimeout(ctx context.Context) {
 	d.mu.Lock()
 	timedOutView := d.curView
+	if d.repStore != nil {
+		mc := d.configs.Latest()
+		leader := d.selectLeader(mc)
+		d.repStore.RecordTimeout(leader.ID)
+	}
 	d.mu.Unlock()
 
 	if err := d.vc.OnTimeout(ctx); err != nil {
@@ -302,23 +282,28 @@ func (d *DHotStuff) HandleTimeout(ctx context.Context) {
 
 	d.mu.Lock()
 	delete(d.votesBuf, timedOutView)
-	// Reset pipeline on view change — no three-chain was completed.
-	d.pipeline.Reset()
+	d.pipeline.Reset() // no three-chain completed in this view
 	d.curView = d.vc.CurView()
 	d.mu.Unlock()
 }
 
-// propose builds and broadcasts a block proposal (leader logic).
-//
-// Implements Algorithm 3, lines 3–11:
-//  1. Drain available requests from requestQ (non-blocking, up to batchSize).
-//  2. Create a new block extending the QC's block hash with the batch.
-//  3. Broadcast the block to the current committee.
+func (d *DHotStuff) selectLeader(mc *membership.Committee) *membership.Replica {
+	if d.repSelector != nil {
+		return d.repSelector.Select(mc, d.curView)
+	}
+	return mc.Leader(d.curView)
+}
+
+// propose builds a block and broadcasts it (leader only, called with mu held).
 func (d *DHotStuff) propose(justify *pb.QuorumCert) {
-	// Must be called with d.mu held.
 	mc := d.configs.Latest()
 
-	// Algorithm 3, lines 3–5: collect batch from request queue.
+	leader := d.selectLeader(mc)
+	if d.repStore != nil {
+		d.repStore.RecordLeaderRound(leader.ID)
+	}
+
+	// drain up to batchSize requests (non-blocking)
 	const batchSize = 100
 	batch := make([]*pb.MembershipRequest, 0, batchSize)
 	for i := 0; i < batchSize; i++ {
@@ -326,16 +311,13 @@ func (d *DHotStuff) propose(justify *pb.QuorumCert) {
 		case req := <-d.requestQ:
 			batch = append(batch, req)
 		default:
-			break // no more requests available right now
 		}
 	}
 
-	// Algorithm 3, lines 6–9: create block.
 	var parentHash []byte
 	var height uint64
 	if justify != nil {
 		parentHash = justify.GetBlockHash()
-		// Look up the parent block to determine height.
 		if parent, ok := d.blockchain.Get(parentHash); ok {
 			height = parent.GetHeight() + 1
 		}
@@ -349,13 +331,12 @@ func (d *DHotStuff) propose(justify *pb.QuorumCert) {
 		ConfNumber: mc.Number,
 	}
 
-	// Algorithm 3, lines 10–11: broadcast to committee.
 	if err := d.net.BroadcastToCommittee(mc, block); err != nil {
 		log.Printf("d-hotstuff: broadcast propose error: %v", err)
 	}
 }
 
-// String returns a human-readable description of the replica state.
+// String returns a quick summary of the replica's current state.
 func (d *DHotStuff) String() string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
