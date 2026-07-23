@@ -1,15 +1,5 @@
-// Package statetransfer implements join-time state synchronization for
-// D-HotStuff.
-//
-// When a new replica is added to the committee (via an ADD membership
-// request), it must obtain the execution history from existing members
-// before it can participate in consensus.
-//
-// From Algorithm 2, line 4: "for batch ∈ hist do mark batch as delivered".
-//
-// History grows linearly with blocks (Fig. 3 in the paper shows linear join
-// latency increase).  Use snapshots (statetransfer/syncer.go) to bound this
-// in production deployments.
+// Package statetransfer handles join-time history sync for D-HotStuff.
+// New replicas replay the committed block history before joining consensus.
 package statetransfer
 
 import (
@@ -20,33 +10,20 @@ import (
 	pb "github.com/prathmesh-d-glitch/d-hotstuff/proto"
 )
 
-// ErrOutOfOrder is returned by Append when the block's height does not match
-// the expected next height in the execution history.
+// ErrOutOfOrder is returned when a block's height doesn't match what's expected next.
 var ErrOutOfOrder = errors.New("statetransfer: block height is out of order")
 
-// ExecutionHistory is an ordered, append-only log of committed blocks that
-// a joining replica replays to reconstruct the application state.
-//
-// Blocks are indexed by height (0 = genesis).  The history is valid iff
-// every block's Height field equals its index in the Blocks slice.
+// ExecutionHistory is an ordered, append-only log of committed blocks.
 type ExecutionHistory struct {
-	// Blocks holds all committed blocks in ascending height order.
 	Blocks []*pb.Block
 }
 
-// NewExecutionHistory creates an empty execution history ready for appending.
+// NewExecutionHistory creates an empty history.
 func NewExecutionHistory() *ExecutionHistory {
 	return &ExecutionHistory{}
 }
 
-// Append adds block to the end of the history.
-//
-// The block's Height field must equal len(h.Blocks) — that is, it must be
-// the immediate successor of the current tail.  This enforces strict
-// monotonicity so that the replay logic in Syncer can rely on contiguous
-// heights.
-//
-// Returns ErrOutOfOrder if the height does not match.
+// Append adds block to the history. Height must equal the current length.
 func (h *ExecutionHistory) Append(block *pb.Block) error {
 	expected := uint64(len(h.Blocks))
 	if block.GetHeight() != expected {
@@ -57,12 +34,7 @@ func (h *ExecutionHistory) Append(block *pb.Block) error {
 	return nil
 }
 
-// Since returns all blocks from height onwards.
-//
-// This is used for delta synchronization when the joining replica already
-// has a snapshot up to some height and only needs the remaining blocks.
-//
-// If height >= len(h.Blocks), an empty slice is returned.
+// Since returns all blocks from height onwards (for delta sync).
 func (h *ExecutionHistory) Since(height uint64) []*pb.Block {
 	if height >= uint64(len(h.Blocks)) {
 		return nil
@@ -70,7 +42,7 @@ func (h *ExecutionHistory) Since(height uint64) []*pb.Block {
 	return h.Blocks[height:]
 }
 
-// Len returns the number of committed blocks in the history.
+// Len returns the number of committed blocks.
 func (h *ExecutionHistory) Len() int {
 	return len(h.Blocks)
 }
@@ -83,26 +55,17 @@ func (h *ExecutionHistory) LatestHeight() int64 {
 	return int64(len(h.Blocks) - 1)
 }
 
-// Hash computes a SHA-256 fingerprint of the entire history by concatenating
-// the hashes of all block hashes.
-//
-// A joining replica uses this to verify that 2fc+1 responses from existing
-// replicas agree on the same execution history (Algorithm 2, line 3).
-//
-// Formally: Hash = SHA-256( blockHash(b0) || blockHash(b1) || … || blockHash(bn) )
-// where blockHash uses the same canonical encoding as the consensus layer
-// (parent_hash || height_BE_8).
+// Hash returns a SHA-256 fingerprint of the full history.
+// Joining replicas use this to confirm 2fc+1 peers agree on the same history.
 func (h *ExecutionHistory) Hash() []byte {
 	hasher := sha256.New()
 	for _, b := range h.Blocks {
 		hasher.Write(blockDigest(b))
 	}
-	sum := hasher.Sum(nil)
-	return sum
+	return hasher.Sum(nil)
 }
 
-// ToProto serializes the execution history into a HistoryResponse message
-// suitable for sending over the wire.
+// ToProto serializes the history for wire transfer.
 func (h *ExecutionHistory) ToProto() *pb.HistoryResponse {
 	return &pb.HistoryResponse{
 		History: h.Blocks,
@@ -110,9 +73,7 @@ func (h *ExecutionHistory) ToProto() *pb.HistoryResponse {
 }
 
 // HistoryFromProto deserializes a HistoryResponse into an ExecutionHistory.
-//
-// Validation: heights must be contiguous starting at 0.  Returns an error
-// if any block's height does not match its position.
+// Returns an error if heights are not contiguous starting from 0.
 func HistoryFromProto(resp *pb.HistoryResponse) (*ExecutionHistory, error) {
 	hist := &ExecutionHistory{
 		Blocks: make([]*pb.Block, 0, len(resp.GetHistory())),
@@ -128,8 +89,7 @@ func HistoryFromProto(resp *pb.HistoryResponse) (*ExecutionHistory, error) {
 	return hist, nil
 }
 
-// blockDigest computes the canonical SHA-256 hash of a block, matching the
-// consensus layer's hashBlock function: SHA-256(parent_hash || height_BE_8).
+// blockDigest computes SHA-256(parentHash || height_BE8) — same as consensus hashBlock.
 func blockDigest(b *pb.Block) []byte {
 	hasher := sha256.New()
 	hasher.Write(b.GetParentHash())
